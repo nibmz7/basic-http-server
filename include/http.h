@@ -24,6 +24,11 @@ typedef struct
     const http_request_t *request;
 } http_conn_context_t;
 
+typedef struct {
+    i
+    off_t *offset;
+} http_client_conn_t;
+
 typedef void (*http_on_client_request_t)(const http_conn_context_t *http_conn_context);
 
 void http_start(const http_on_client_request_t *on_client_request, int port);

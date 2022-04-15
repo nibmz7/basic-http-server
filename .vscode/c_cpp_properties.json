@@ -1,0 +1,9 @@
+{
+  "configurations": [
+    {
+      "name": "Mac",
+      "includePath": ["${workspaceFolder}/lib"]
+    }
+  ],
+  "version": 4
+}

@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -17,6 +18,44 @@
 
 #define MAX_EVENTS 10
 
+// - source file descriptor
+// - \*method
+// - \*uri
+// - \*header_field
+//   - key (strdup)
+//   - value (strdup)
+// - header_size
+// - \*number of bytes sent
+
+typedef struct header_field
+{
+    const char *name;
+    const char *value;
+    const struct header_field *next;
+} header_field_t;
+
+typedef struct
+{
+    int fd;
+    char *method;
+    char *uri;
+    const header_field_t *header_field;
+} client_conn_data_t;
+
+static void set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1)
+    {
+        perror("fcntl()");
+        return;
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
+    {
+        perror("fcntl()");
+    }
+}
+
 int main(int argc, char *argv[])
 {
     struct addrinfo hints;
@@ -29,10 +68,7 @@ int main(int argc, char *argv[])
     hints.ai_flags = AI_PASSIVE;     /* For wildcard IP address */
     hints.ai_protocol = IPPROTO_TCP; /* TCP */
 
-    /* getaddrinfo() returns a list of address structures.
-        Try each address until we successfully bind(2).
-        If socket(2) (or bind(2)) fails, we (close the socket
-        and) try the next address. */
+    // getaddrinfo() returns a list of address structures.
     if ((status = getaddrinfo(NULL, "80", &hints, &result)) != 0)
     {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(status));
@@ -50,10 +86,7 @@ int main(int argc, char *argv[])
         if (setsockopt(listen_sd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) == -1)
             continue;
 
-        // Set socket to non-blocking
-        int flags = fcntl(listen_sd, F_GETFL, 0);
-        if (fcntl(listen_sd, F_SETFL, flags | O_NONBLOCK))
-            continue;
+        set_nonblocking(listen_sd);
 
         if (bind(listen_sd, rp->ai_addr, rp->ai_addrlen) == 0)
             break; /* Success */
@@ -76,7 +109,7 @@ int main(int argc, char *argv[])
         exit(-1);
     }
 
-    struct epoll_event ev, events[MAX_EVENTS];
+    struct epoll_event ev;
     int client_sock, nfds, epollfd, n;
     struct sockaddr_storage client_addr; // connector's address information
     socklen_t addr_size;
@@ -92,14 +125,15 @@ int main(int argc, char *argv[])
     }
 
     // Add listener socket for epoll to watch
-    ev.events = EPOLLIN;
-    ev.data.fd = listen_sd;
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.ptr = NULL;
     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, listen_sd, &ev) == -1)
     {
         perror("epoll_ctl: listen_sd");
         exit(EXIT_FAILURE);
     }
 
+    struct epoll_event *events = calloc(MAX_EVENTS, sizeof(ev));
     for (;;)
     {
         nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
@@ -108,20 +142,39 @@ int main(int argc, char *argv[])
             perror("epoll_wait");
             exit(EXIT_FAILURE);
         }
-
         for (n = 0; n < nfds; ++n)
         {
-            if (events[n].data.fd == listen_sd)
+            if ((events[n].events & EPOLLERR) || (events[n].events & EPOLLHUP))
             {
+                // error case
+                fprintf(stderr, "epoll error\n");
+                // close(events[n].data.fd);
+                continue;
+            }
+            if (events[n].data.ptr == NULL)
+            {
+
                 client_sock = accept(listen_sd, (struct sockaddr *)&client_addr, &addr_size);
                 if (client_sock == -1)
                 {
                     perror("accept");
                     exit(EXIT_FAILURE);
                 }
+                set_nonblocking(client_sock);
+
+                client_conn_data_t *ptr;
+                ptr = (client_conn_data_t *)calloc(1, sizeof(client_conn_data_t));
+
+                if (ptr == NULL)
+                {
+                    printf("Memory allocation failed");
+                    exit(1); // exit the program
+                }
+
+                ptr->fd = client_sock;
                 // Add client socket for epoll to watch
-                ev.events = EPOLLOUT;
-                ev.data.fd = client_sock;
+                ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+                ev.data.ptr = ptr;
                 if (epoll_ctl(epollfd, EPOLL_CTL_ADD, client_sock,
                               &ev) == -1)
                 {
@@ -133,8 +186,59 @@ int main(int argc, char *argv[])
             else
             {
                 // Not sure how to move on from here yet...
-                printf("Socker ready %d\n", events[n].data.fd);
-                close(events[n].data.fd);
+                if (((events[n].events & EPOLLIN)))
+                {
+                    // client socket; read as much data as we can
+                    char buf[1024];
+                    const int client_fd = ((client_conn_data_t *)events[n].data.ptr)->fd;
+                    for (;;)
+                    {
+                        ssize_t nbytes = read(client_fd, buf, sizeof(buf));
+                        if (nbytes == -1)
+                        {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                            {
+                                printf("finished reading data from client\n");
+                                break;
+                            }
+                            else
+                            {
+                                perror("read()");
+                                return 1;
+                            }
+                        }
+                        else if (nbytes == 0)
+                        {
+                            printf("finished with %d\n", client_fd);
+                            close(client_fd);
+                            break;
+                        }
+                        else
+                        {
+                            int i;
+                            int first_line = 1;
+                            for (i = 0; i < nbytes; i++)
+                            {
+                                if (buf[i] == '\n')
+                                {
+                                    if (first_line)
+                                    {
+                                        char *method, *uri, *version;
+                                        sscanf(buf, "%ms %ms %ms\n", &method, &uri, &version);
+                                        ((client_conn_data_t *)events[n].data.ptr)->uri = uri;
+                                        ((client_conn_data_t *)events[n].data.ptr)->method = method;
+                                    }
+                                    else
+                                    {
+                                    }
+                                    first_line = 0;
+                                }
+                            }
+
+                            printf("%s %s\n", ((client_conn_data_t *)events[n].data.ptr)->method, ((client_conn_data_t *)events[n].data.ptr)->uri);
+                        }
+                    }
+                }
             }
         }
     }

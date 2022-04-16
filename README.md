@@ -5,6 +5,8 @@ Trying to learn C by doing. This is an attempt on a very basic http server that 
 ## Usage
 
 ```sh
+docker build -t c-program .
+
 docker run \
 -it \
 --name c-program-dev \
@@ -12,15 +14,36 @@ docker run \
 -p 80:80 \
 c-program bash
 
+# For subsequent runs
+docker start -i c-program-dev
+
 make
 
 ./bin/startServer port=8080 dir=./website
 ```
 
+## Todos
+
+1. Parse header up to /r/n/r/n point and extract target uri and get static file location
+
+2. Create struct to store connection data and set its pointer to epoll_event data \*ptr
+
+- source file descriptor
+- \*method
+- \*uri
+- \*header_field
+  - key (strdup)
+  - value (strdup)
+- header_size
+- \*number of bytes sent
+
+3. Use sendfile to send data to client. Close connection once complete. If error EGAIN - continue, if zero means EOF
+
 ## References
 
 - [Beej's Guide to Network Programming](https://beej.us/guide/bgnet/html/)
 - [Using poll() instead of select()](https://www.ibm.com/docs/en/i/7.4?topic=designs-using-poll-instead-select)
+- [Blocking I/O, Nonblocking I/O, And Epoll](https://eklitzke.org/blocking-io-nonblocking-io-and-epoll)
 - [LibHTTP – Open Source HTTP Library in C](https://github.com/lammertb/libhttp)
 - [HTTP Server: Everything you need to know to Build a simple HTTP server from scratch](https://medium.com/from-the-scratch/http-server-what-do-you-need-to-know-to-build-a-simple-http-server-from-scratch-d1ef8945e4fa)
 - [HTTP Server in C](https://dev-notes.eu/2018/06/http-server-in-c/)

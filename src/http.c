@@ -13,8 +13,9 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <fcntl.h>     // for fcntl()
-#include <sys/epoll.h> // for epoll_create1(), epoll_ctl(), struct epoll_event
+#include <fcntl.h>        // for fcntl()
+#include <sys/epoll.h>    // for epoll_create1(), epoll_ctl(), struct epoll_event
+#include <sys/sendfile.h> // for sendfile()
 
 #define MAX_EVENTS 10
 
@@ -27,6 +28,9 @@
 // - header_size
 // - \*number of bytes sent
 
+#define BUF_SIZE 4096 * 1000
+#define RES_HEADER_SIZE 32000
+
 typedef struct header_field
 {
     const char *name;
@@ -37,8 +41,11 @@ typedef struct header_field
 typedef struct
 {
     int fd;
+    int source_fd;
     char *method;
     char *uri;
+    char *version;
+    off_t *offset;
     const header_field_t *header_field;
 } client_conn_data_t;
 
@@ -126,7 +133,7 @@ int main(int argc, char *argv[])
 
     // Add listener socket for epoll to watch
     ev.events = EPOLLIN | EPOLLET;
-    ev.data.ptr = NULL;
+    ev.data.fd = listen_sd;
     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, listen_sd, &ev) == -1)
     {
         perror("epoll_ctl: listen_sd");
@@ -151,9 +158,9 @@ int main(int argc, char *argv[])
                 // close(events[n].data.fd);
                 continue;
             }
-            if (events[n].data.ptr == NULL)
-            {
 
+            if (events[n].data.fd == listen_sd)
+            {
                 client_sock = accept(listen_sd, (struct sockaddr *)&client_addr, &addr_size);
                 if (client_sock == -1)
                 {
@@ -172,6 +179,8 @@ int main(int argc, char *argv[])
                 }
 
                 ptr->fd = client_sock;
+                ptr->uri = NULL;
+                ptr->offset = 0;
                 // Add client socket for epoll to watch
                 ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
                 ev.data.ptr = ptr;
@@ -185,15 +194,15 @@ int main(int argc, char *argv[])
             }
             else
             {
-                // Not sure how to move on from here yet...
+                // Read/write from/to client socket
+                client_conn_data_t *conn = events[n].data.ptr;
                 if (((events[n].events & EPOLLIN)))
                 {
                     // client socket; read as much data as we can
                     char buf[1024];
-                    const int client_fd = ((client_conn_data_t *)events[n].data.ptr)->fd;
                     for (;;)
                     {
-                        ssize_t nbytes = read(client_fd, buf, sizeof(buf));
+                        ssize_t nbytes = read(conn->fd, buf, sizeof(buf));
                         if (nbytes == -1)
                         {
                             if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -209,8 +218,8 @@ int main(int argc, char *argv[])
                         }
                         else if (nbytes == 0)
                         {
-                            printf("finished with %d\n", client_fd);
-                            close(client_fd);
+                            printf("finished with %d\n", conn->fd);
+                            close(conn->fd);
                             break;
                         }
                         else
@@ -221,23 +230,63 @@ int main(int argc, char *argv[])
                             {
                                 if (buf[i] == '\n')
                                 {
-                                    if (first_line)
+                                    if (first_line && conn->uri == NULL)
                                     {
                                         char *method, *uri, *version;
                                         sscanf(buf, "%ms %ms %ms\n", &method, &uri, &version);
-                                        ((client_conn_data_t *)events[n].data.ptr)->uri = uri;
-                                        ((client_conn_data_t *)events[n].data.ptr)->method = method;
+                                        conn->uri = uri;
+                                        conn->method = method;
+                                        conn->version = version;
                                     }
                                     else
                                     {
+                                        // Ignore for now
                                     }
                                     first_line = 0;
                                 }
                             }
-
-                            printf("%s %s\n", ((client_conn_data_t *)events[n].data.ptr)->method, ((client_conn_data_t *)events[n].data.ptr)->uri);
                         }
                     }
+                }
+
+                if (conn->uri != NULL)
+                {
+                    if (!conn->source_fd)
+                    {
+                        // TODO: Open file from request uri
+                        // TODO: Share file descriptor for multiple connections requesting the same file
+                        conn->source_fd = open("./website/index.html", O_RDONLY);
+                        struct stat stat_buf;
+                        if (fstat(conn->source_fd, &stat_buf) == -1)
+                        {
+                            perror("lstat");
+                            exit(EXIT_FAILURE);
+                        }
+                        int offset;
+                        char res_header_buf[RES_HEADER_SIZE];
+                        offset = snprintf(res_header_buf, RES_HEADER_SIZE, "HTTP/1.1 200 OK\r\n");
+                        offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "Server: Basic Web Server\r\n");
+                        offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "Content-length: %d\r\n", (int)stat_buf.st_size);
+                        offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "Content-type: %s\r\n", "text/html");
+                        offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "\r\n");
+                        write(conn->fd, res_header_buf, offset);
+                    }
+                    int n = 1;
+                    while (n > 0)
+                    {
+                        n = sendfile(conn->fd, conn->source_fd, conn->offset, BUF_SIZE);
+                    }
+
+                    if (n == -1 && errno == EAGAIN)
+                    {
+                        printf("Blocked writing to %d\n", conn->fd);
+                        continue;
+                    }
+
+                    printf("finished sending file %d to %d\n", conn->source_fd, conn->fd);
+                    close(conn->fd);
+                    close(conn->source_fd);
+                    // TODO: Free allocated memory
                 }
             }
         }

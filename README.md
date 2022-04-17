@@ -10,7 +10,8 @@ docker build -t c-program .
 docker run \
 -it \
 --name c-program-dev \
--v "$(pwd)"/src:/usr/src/myapp/src \
+-v "$(pwd)"/src:/usr/src/app/src \
+-v "$(pwd)"/website:/usr/src/app/website \
 -p 80:80 \
 c-program bash
 

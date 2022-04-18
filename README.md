@@ -20,7 +20,7 @@ docker start -i c-program-dev
 
 make
 
-./bin/startServer port=8080 dir=./website
+./bin/startServer --port=8080 --dir=./website
 ```
 
 ## Todos

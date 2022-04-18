@@ -16,6 +16,7 @@
 #include <fcntl.h>        // for fcntl()
 #include <sys/epoll.h>    // for epoll_create1(), epoll_ctl(), struct epoll_event
 #include <sys/sendfile.h> // for sendfile()
+#include "http.h"
 
 #define MAX_EVENTS 10
 
@@ -45,6 +46,7 @@ typedef struct
     char *method;
     char *uri;
     char *version;
+    int finished_reading;
     off_t *offset;
     const header_field_t *header_field;
 } client_conn_data_t;
@@ -65,6 +67,12 @@ static void set_nonblocking(int fd)
 
 int main(int argc, char *argv[])
 {
+    option_t option;
+
+    get_options(argc, argv, &option);
+    setcwd(option.dir);
+    printf("port: %d\ncwd: %s\n", option.port, cwd);
+
     struct addrinfo hints;
     struct addrinfo *result, *rp;
     int listen_sd, status, yes = 1;
@@ -132,7 +140,8 @@ int main(int argc, char *argv[])
     }
 
     // Add listener socket for epoll to watch
-    ev.events = EPOLLIN | EPOLLET;
+    ev.events = EPOLLIN;
+    // ev.events = EPOLLIN | EPOLLET; TODO: Fix bug when using Edge triggered polling
     ev.data.fd = listen_sd;
     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, listen_sd, &ev) == -1)
     {
@@ -149,12 +158,16 @@ int main(int argc, char *argv[])
             perror("epoll_wait");
             exit(EXIT_FAILURE);
         }
+        printf("\nepoll event: %d\n", nfds);
         for (n = 0; n < nfds; ++n)
         {
             if ((events[n].events & EPOLLERR) || (events[n].events & EPOLLHUP))
             {
                 // error case
                 fprintf(stderr, "epoll error\n");
+                /**
+                 * TODO: Get correct file descriptor and free allocated memory if required
+                 */
                 // close(events[n].data.fd);
                 continue;
             }
@@ -181,11 +194,12 @@ int main(int argc, char *argv[])
                 ptr->fd = client_sock;
                 ptr->uri = NULL;
                 ptr->offset = 0;
+                ptr->finished_reading = 0;
                 // Add client socket for epoll to watch
-                ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+                // ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+                ev.events = EPOLLIN | EPOLLOUT;
                 ev.data.ptr = ptr;
-                if (epoll_ctl(epollfd, EPOLL_CTL_ADD, client_sock,
-                              &ev) == -1)
+                if (epoll_ctl(epollfd, EPOLL_CTL_ADD, client_sock, &ev) == -1)
                 {
                     perror("epoll_ctl: client_sock");
                     exit(EXIT_FAILURE);
@@ -198,8 +212,13 @@ int main(int argc, char *argv[])
                 client_conn_data_t *conn = events[n].data.ptr;
                 if (((events[n].events & EPOLLIN)))
                 {
+
                     // client socket; read as much data as we can
+                    /**
+                     * TODO: Parse all header fields and handle blocking read
+                     */
                     char buf[1024];
+                    printf("Reading from client %d\n", conn->fd);
                     for (;;)
                     {
                         ssize_t nbytes = read(conn->fd, buf, sizeof(buf));
@@ -207,7 +226,7 @@ int main(int argc, char *argv[])
                         {
                             if (errno == EAGAIN || errno == EWOULDBLOCK)
                             {
-                                printf("finished reading data from client\n");
+                                printf("blocked reading data from client %d\n", conn->fd);
                                 break;
                             }
                             else
@@ -218,8 +237,8 @@ int main(int argc, char *argv[])
                         }
                         else if (nbytes == 0)
                         {
-                            printf("finished with %d\n", conn->fd);
-                            close(conn->fd);
+                            conn->finished_reading = 1;
+                            printf("finished reading from client %d\n", conn->fd);
                             break;
                         }
                         else
@@ -232,6 +251,7 @@ int main(int argc, char *argv[])
                                 {
                                     if (first_line && conn->uri == NULL)
                                     {
+                                        printf("Read request info for %d\n", conn->fd);
                                         char *method, *uri, *version;
                                         sscanf(buf, "%ms %ms %ms\n", &method, &uri, &version);
                                         conn->uri = uri;
@@ -251,25 +271,38 @@ int main(int argc, char *argv[])
 
                 if (conn->uri != NULL)
                 {
+                    printf("Writing to client %d\n", conn->fd);
                     if (!conn->source_fd)
                     {
-                        // TODO: Open file from request uri
-                        // TODO: Share file descriptor for multiple connections requesting the same file
-                        conn->source_fd = open("./website/index.html", O_RDONLY);
-                        struct stat stat_buf;
-                        if (fstat(conn->source_fd, &stat_buf) == -1)
+                        /**
+                         * TODO: Get mime type
+                         */
+                        int offset;
+                        file_info_t file_info;
+                        char res_header_buf[RES_HEADER_SIZE];
+
+                        if (get_static_file_info(conn->uri, &file_info) == -1)
                         {
-                            perror("lstat");
+                            offset = snprintf(res_header_buf, RES_HEADER_SIZE, "HTTP/1.1 404 Not found\r\n");
+                        }
+                        else
+                        {
+                            conn->source_fd = file_info.fd;
+                            offset = snprintf(res_header_buf, RES_HEADER_SIZE, "HTTP/1.1 200 OK\r\n");
+                            offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "Server: Basic Web Server\r\n");
+                            offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "Content-length: %d\r\n", (int)file_info.size);
+                            offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "Content-type: %s\r\n", file_info.mime_type);
+                        }
+                        offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "\r\n");
+
+                        /**
+                         * TODO: Handle blocking write (EAGAIN or EWOULDBLOCK)
+                         */
+                        if (write(conn->fd, res_header_buf, offset) == -1)
+                        {
+                            perror("write headers");
                             exit(EXIT_FAILURE);
                         }
-                        int offset;
-                        char res_header_buf[RES_HEADER_SIZE];
-                        offset = snprintf(res_header_buf, RES_HEADER_SIZE, "HTTP/1.1 200 OK\r\n");
-                        offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "Server: Basic Web Server\r\n");
-                        offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "Content-length: %d\r\n", (int)stat_buf.st_size);
-                        offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "Content-type: %s\r\n", "text/html");
-                        offset += snprintf(res_header_buf + offset, RES_HEADER_SIZE, "\r\n");
-                        write(conn->fd, res_header_buf, offset);
                     }
                     int n = 1;
                     while (n > 0)
@@ -283,10 +316,15 @@ int main(int argc, char *argv[])
                         continue;
                     }
 
-                    printf("finished sending file %d to %d\n", conn->source_fd, conn->fd);
+                    printf("finished sending file to %d\n", conn->fd);
                     close(conn->fd);
                     close(conn->source_fd);
-                    // TODO: Free allocated memory
+                    epoll_ctl(epollfd, EPOLL_CTL_DEL, conn->fd, NULL);
+                    /**
+                     * TODO: Free allocated memory
+                     * 1) client_conn_data_t
+                     * 2) method, uri, version from sscanf
+                     */
                 }
             }
         }

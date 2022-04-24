@@ -6,7 +6,7 @@
 
 void get_options(int argc, char **args, option_t *option)
 {
-    int port = 80;
+    char *port = "80";
     char *dir = "./";
 
     static struct option long_options[] = {
@@ -34,7 +34,7 @@ void get_options(int argc, char **args, option_t *option)
 
             if (strcmp(option_name, "port") == 0)
             {
-                port = atoi(optarg);
+                port = optarg;
             }
             else if (strcmp(option_name, "dir") == 0)
             {

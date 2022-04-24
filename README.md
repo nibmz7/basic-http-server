@@ -1,6 +1,7 @@
 ## About
 
-Trying to learn C by doing. This is an attempt on a very basic http server that serves static files out of a directory.
+Trying to learn C by doing. This is an attempt on a very basic http server that serves static files out of a directory. 
+- Uses non-blocking io sockets and edge-triggered polling with epoll.
 
 ## Usage
 
